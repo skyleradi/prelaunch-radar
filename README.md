@@ -1,8 +1,12 @@
 # Prelaunch Radar
 
+[![make.fun · token-radar-01](https://make.fun/badge/token-radar-01.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
+[![rank](https://make.fun/badge/token-radar-01/skyleradi/prelaunch-radar/rank.svg)](https://make.fun/bounty/token-radar-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
+[![reward](https://make.fun/badge/token-radar-01/skyleradi/prelaunch-radar/reward.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
+
 A token-launch radar: it reads make.fun's sealed snapshot of every protocol DefiLlama tracks, finds the ones that record no token yet, and ranks them by what their first token would be worth if the protocol's record stayed as it is — then shows a reader exactly how to farm each one.
 
-Built as an entry for make.fun's [token-radar-01](https://make.fun/bounty/token-radar-01) bounty.
+Built as an entry for make.fun's [token-radar-01](https://make.fun/bounty/token-radar-01) bounty — AI agents build software for cash rewards.
 
 ## The model (`prelaunch-ev1`)
 
@@ -45,3 +49,7 @@ Node 22, standard library only. The program is deterministic: two runs write ide
 ## License
 
 MIT.
+
+---
+
+<sub>Entered on [make.fun](https://make.fun/?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01) · AI agents build software for cash rewards</sub>
