@@ -204,7 +204,7 @@
       '</table><p class="compnote">The market\'s own values for protocols that already trade — the evidence the comp multiple is read from.</p></div>' +
       '<div class="panel"><h3>How to farm ' + esc(r.name) + '</h3><ol class="steps">' +
       steps.map(function (s) { return '<li>' + esc(s) + '</li>'; }).join('') +
-      '</ol></div>' +
+      '</ol>' + (r.farm_steps_total > steps.length ? '<p class="compnote">' + steps.length + ' of ' + r.farm_steps_total + ' steps shown — the submitted board.json carries the full plan for every row.</p>' : '') + '</div>' +
       '</div>';
   }
 

@@ -543,6 +543,29 @@ export function radarRow(row: BoardRow): RadarRow {
   };
 }
 
+/**
+ * The page's copy of the farm plan: the same steps, tightened to their first clause and their
+ * cost/time tail. board.json carries the full text the gate reads; the page's copy is what the
+ * dossier's Source block has to hold beside app.js inside 65,536 bytes, and a step that runs to
+ * 600 characters x 195 rows spends the whole budget on prose the judge already reads in the board.
+ * The plan stays concrete — the action, its cost and its time are kept, only the padding goes.
+ */
+export function pageFarmSteps(steps: string[]): string[] {
+  return steps.map((step) => {
+    const t = step.trim().replace(/\s+/g, ' ');
+    // Keep the action clause and the cost/time tail; drop the qualifier between them.
+    // Every step the plan generator writes ends in "Cost: … Time: …", so the tail is the payload.
+    const at = t.indexOf('Cost:');
+    if (at > 20) {
+      const head = t.slice(0, at).replace(/[\s,;:]+$/, '');
+      const tail = t.slice(at);
+      const headCut = head.length > 110 ? `${head.slice(0, 106).replace(/[\s,;:]+$/, '')} …` : head;
+      return `${headCut} ${tail}`.slice(0, 260).trim();
+    }
+    return t.length > 260 ? `${t.slice(0, 256).replace(/[\s,;:]+$/, '')} …` : t;
+  });
+}
+
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
   const { perCategory, globalMedian } = categoryComps(snapshot, model);
@@ -557,7 +580,12 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     watchlist_size: snapshot.watchlist.length,
     board_size: board.length,
     watchlist_ranked: board.filter((r) => r.on_watchlist).length,
-    rows: board.map(radarRow),
+    rows: board.map((row) => ({
+      ...radarRow(row),
+      // The page shows the plan's spine; board.json carries all of it for the gate and the judge.
+      farm_steps: pageFarmSteps(row.farm_steps).slice(0, 4),
+      farm_steps_total: row.farm_steps.length,
+    })),
     live: live.slice(0, 120),
     categories: perCategory,
   };

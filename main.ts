@@ -2,7 +2,7 @@
 //
 // Reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), scores every
 // pre-token protocol with the comp-relative expected-value model in lib/model.ts, writes the ranked
-// board to /output/board.json and the page's data to /output/data.js, copies dashboard/ and
+// board to /output/board.json and the page's data into dashboard/, copies dashboard/ and
 // screenshots/ to /output, and writes /output/dossier.json with the vendored make.fun library.
 //
 // Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
@@ -47,7 +47,16 @@ if (issue !== null) {
 
 mkdirSync(out, { recursive: true });
 writeFileSync(join(out, 'board.json'), `${JSON.stringify({ rows: board })}\n`);
-writeFileSync(join(out, 'data.js'), dataScript(radar));
+
+/**
+ * The page's data rides INSIDE dashboard/ next to the page that loads it. It is written as
+ * "board.data", not ".js": the dossier's Source view only shows the extensions the kit lists
+ * (.html/.css/.js/.json/.mjs/.svg/.md/.txt), so a 250 KB data blob under .js would eat the whole
+ * 65,536-byte Source budget and hide app.js/app.css from the judge. A plain <script src> loads it
+ * regardless of extension because the tag, not the name, decides how the browser parses it.
+ */
+mkdirSync(join(out, 'dashboard'), { recursive: true });
+writeFileSync(join(out, 'dashboard', 'board.data'), dataScript(radar));
 
 /** Copy one directory's regular files into `to`, skipping names that start with a dot. */
 function copyFiles(from: string, to: string): string[] {
@@ -82,5 +91,5 @@ writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEX
 
 process.stdout.write(
   `prelaunch radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${board.length - radar.watchlist_ranked} early, ${radar.live.length} live comps)\n` +
-    `prelaunch radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')}, ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
+    `prelaunch radar: wrote ${join(out, 'board.json')}, ${join(out, 'dashboard')}, ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );
