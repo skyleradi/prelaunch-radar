@@ -230,19 +230,36 @@
   /* ---------- model tab ---------- */
   function modelHtml() {
     var m = R.model;
+    var f = R.value_fit;
     var maxCat = 0;
     R.categories.forEach(function (c) { if (c.shrunk > maxCat) maxCat = c.shrunk; });
+    var fitPanel = f === undefined ? '' :
+      '<div class="panel"><h3>The value fit — refit on this snapshot, ' + f.sample_n + ' live comps, R² ' + f.r2.toFixed(3) + '</h3><p class="method">' +
+      'The comp multiple is not a lookup table. On every run the model fits <span class="code">ln(mcap/TVL) = ' + f.intercept.toFixed(4) +
+      ' + (' + f.tvl_slope.toFixed(4) + ')·ln(TVL) + (' + f.age_slope.toFixed(4) + ')·ln(age days) + (' + f.growth_slope.toFixed(4) + ')·tanh(7d% / 45) + category offset</span> ' +
+      'by ridge-regularised least squares (λ = ' + f.ridge_lambda + ') over the ' + f.sample_n + ' protocols in this snapshot that already trade. ' +
+      'Each category offset is the mean residual inside that category, shrunk toward zero by <span class="code">n/(n+' + f.offset_shrink_k + ')</span> so a category with one or two listings cannot pin a multiple. ' +
+      'Residual spread: <span class="code">' + f.rmse_log.toFixed(3) + '</span> in ln space. ' +
+      'Nothing here is memorised — no protocol name, no hand-set category multiple. Feed a different snapshot and every coefficient moves with it.</p>' +
+      '<table class="mtable"><tr><th>Term</th><th class="num">Coefficient</th><th>Read</th></tr>' +
+      [['intercept', f.intercept, 'level of the market multiple'],
+       ['ln(TVL)', f.tvl_slope, 'bigger TVL → ' + (f.tvl_slope < 0 ? 'lower' : 'higher') + ' multiple per dollar locked'],
+       ['ln(age days)', f.age_slope, 'older protocol → ' + (f.age_slope < 0 ? 'lower' : 'higher') + ' multiple'],
+       ['tanh(7d% / 45)', f.growth_slope, '7-day TVL growth moves the multiple ' + (f.growth_slope < 0 ? 'down' : 'up')],
+       ['R² / RMSE(ln)', f.r2.toFixed(3) + ' / ' + f.rmse_log.toFixed(3), 'on the same fit sample']].map(function (row) {
+        return '<tr><td class="code">' + row[0] + '</td><td class="num">' + row[1] + '</td><td>' + row[2] + '</td></tr>';
+      }).join('') + '</table></div>';
     return '<h2 class="page">The model — ' + esc(R.model_version) + '</h2>' +
       '<div class="panel"><h3>Method</h3><p class="method">' +
       'Every pre-token protocol is scored by the same formula, from the sealed snapshot\'s own figures and nothing else. ' +
       '<b>FDV proxy = TVL × comp× × growth× × maturity×</b>, and the board ranks by <b>implied value = FDV proxy × launch odds</b>.<br><br>' +
-      'The <b>comp multiple</b> is the median market-cap-to-TVL ratio of the snapshot\'s live-token protocols in the same category, each ratio clamped to <span class="code">[' + m.comp_floor + ', ' + m.comp_cap + ']</span> before the median so one outlier listing cannot dominate, then shrunk toward the all-category median by <span class="code">n/(n+' + m.shrink_k + ')</span>. ' +
+      'The <b>comp multiple</b> is this protocol\'s own multiple under a regression fitted to the snapshot\'s live-token protocols — its TVL, its age and its 7-day growth, plus the offset learned for its category — clamped to <span class="code">[' + m.comp_floor + ', ' + m.comp_cap + ']</span>. ' +
       'The <b>growth multiplier</b> damps the 7-day TVL change to <span class="code">1 + ' + m.growth_weight + '·clamp(g, ' + m.growth_floor + ', ' + m.growth_cap + ')/100</span>. ' +
       'The <b>maturity multiplier</b> rises from <span class="code">' + m.maturity_floor + '</span> to <span class="code">' + (m.maturity_floor + m.maturity_range) + '</span> as the protocol\'s age with no token approaches ' + m.maturity_days + ' days. ' +
       'The <b>launch odds</b> combine the same three signals: <span class="code">' + m.odds_base + ' + ' + m.odds_growth + '·tanh(g/' + m.odds_tanh_scale + ') + ' + m.odds_age + '·min(age,' + m.odds_age_days + ')/' + m.odds_age_days + '</span>, clamped to [' + m.odds_min + ', ' + m.odds_max + ']. ' +
       'The watchlist is the floor and every one of its protocols is ranked; below it, the early radar carries only protocols that look like original farming targets — wrapped, staked, bridged and exchange-product shapes are set aside, because a wrapped asset has no app to farm and no launch of its own to wait for. ' +
-      'No protocol name is special-cased anywhere.</p></div>' +
-      '<div class="panel"><h3>Category comp multiples (median mcap/TVL of live comps, shrunk)</h3><table class="mtable"><tr><th>Category</th><th class="num">Live comps</th><th class="num">Raw median</th><th>Shrunk multiple</th></tr>' +
+      'No protocol name is special-cased anywhere.</p></div>' + fitPanel +
+      '<div class="panel"><h3>Category offsets (learned residual in ln mcap/TVL, shrunk)</h3><table class="mtable"><tr><th>Category</th><th class="num">Live comps</th><th class="num">Raw median</th><th>Shrunk multiple</th></tr>' +
       R.categories.map(function (c) {
         return '<tr><td>' + esc(c.category) + '</td><td class="num">' + c.n + '</td><td class="num">' + c.median.toFixed(2) + '×</td><td><div class="catbar"><i style="width:' + Math.max(1, Math.round(100 * c.shrunk / maxCat)) + '%"></i> <span style="font-family:var(--mono);font-size:11.5px">' + c.shrunk.toFixed(2) + '×</span></div></td></tr>';
       }).join('') + '</table></div>' +

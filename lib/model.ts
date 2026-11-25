@@ -3,10 +3,13 @@
 // Every protocol that records no token (no market cap, no CoinGecko id, no symbol) and is not a
 // versioned pool or an exchange is scored by one function, from the snapshot's own figures only:
 //
-//   comp_mult  = shrunk median of mcap/tvl over the snapshot's LIVE-token protocols of the same
-//                category, weighted toward the all-categories median by n/(n+K)   [evidence, not a
-//                hand-set constant: the market's own ratios, read from the snapshot]
-//   growth_mult= 1 + GROWTH_WEIGHT * clamp(change_7d, -60, +120) / 100              [7-day growth]
+//   ratio      = mcap_usd / tvl_usd on a protocol that already trades     [the thing we predict]
+//   ln(ratio)  = b0 + b1*ln(tvl) + b2*ln(age_days) + b3*tanh(change_7d/45) + cat_offset
+//                                                                        [fitted, not hand-set]
+//   cat_offset = shrunk mean residual of ln(ratio) inside one category, weighted toward zero by
+//                n/(n+K) so a category with two listings cannot pin a multiplier
+//   comp_mult  = exp(ln(ratio) at this protocol's own tvl, age and growth)  [its own comp]
+//   growth_mult= 1 + GROWTH_WEIGHT * clamp(change_7d, -60, +120) / 100     [7-day momentum]
 //   mature_mult= MATURITY_FLOOR + MATURITY_RANGE * min(age_days, MATURITY_DAYS) / MATURITY_DAYS
 //                                                                  [how long it has run with no token]
 //   fdv_proxy  = tvl_usd * comp_mult * growth_mult * mature_mult    [what the token may price at]
@@ -14,9 +17,11 @@
 //                        + ODDS_AGE * min(age_days, ODDS_AGE_DAYS)/ODDS_AGE_DAYS)  [launch odds]
 //   implied    = round(fdv_proxy * odds)                            [expected value of the launch]
 //
-// No protocol name is ever special-cased: the same function scores every row, and the board's data
-// carries each row's factors so a reader can recompute every number on the page.
-
+// Every coefficient above is REFIT from the snapshot on each run by `fitValueModel` — ridge-
+// regularised least squares over the snapshot's own live-token protocols. Nothing is memorised:
+// no protocol name, no category multiplier, no market multiple is written into this file. Change
+// the snapshot and every number moves with it; the Model tab prints the fit it ran on.
+//
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
   slug: string;
@@ -83,7 +88,7 @@ export const MODEL: ModelConstants = {
   odds_max: 0.85,
 };
 
-export const MODEL_VERSION = 'prelaunch-ev1';
+export const MODEL_VERSION = 'prelaunch-ev2';
 
 /** A farm step: the action, what it costs, and how long it takes. */
 export interface FarmStep {
@@ -178,6 +183,22 @@ export interface RadarData {
   rows: RadarRow[];
   live: LiveRow[];
   categories: CategoryComp[];
+  /** The pooled multiple the fit falls back to when a category was never measured. */
+  global_median: number;
+  /** The fit itself, so the Model tab can print the equation and its R² rather than assert it. */
+  value_fit: {
+    kinds: string;
+    refit: string;
+    intercept: number;
+    tvl_slope: number;
+    age_slope: number;
+    growth_slope: number;
+    sample_n: number;
+    r2: number;
+    rmse_log: number;
+    offset_shrink_k: number;
+    ridge_lambda: number;
+  };
 }
 
 /** Why the snapshot is not one this model can score. */
@@ -244,35 +265,194 @@ function median(values: number[]): number {
 }
 
 /**
- * The comp evidence per category: the snapshot's live-token protocols' own mcap/tvl ratios, shrunk
- * toward the all-categories median by n/(n+K) so a category with one listing cannot dominate.
+ * One category's learned offset in ln(mcap/tvl), with the sample it was learned on. Reported on the
+ * Model tab so a reader sees which categories were measured and which fell back to the pool.
  */
-export function categoryComps(snapshot: Snapshot, model: ModelConstants): { perCategory: CategoryComp[]; globalMedian: number } {
-  const ratios = new Map<string, number[]>();
-  const all: number[] = [];
-  for (const p of snapshot.protocols) {
-    if (p.mcap_usd === null || p.tvl_usd < 1_000_000 || !Number.isFinite(p.mcap_usd)) continue;
-    // A market cap past 10× TVL prices far more than capital locked; it is noise as a comp
-    // signal, not evidence. Every ratio is clamped to the model's band before any median.
-    const r = clamp(p.mcap_usd / p.tvl_usd, model.comp_floor, model.comp_cap);
-    if (!(r > 0) || !Number.isFinite(r)) continue;
-    all.push(r);
-    if (p.category !== null) {
-      const bucket = ratios.get(p.category);
-      if (bucket === undefined) ratios.set(p.category, [r]);
-      else bucket.push(r);
+export interface CategoryComp {
+  category: string;
+  n: number;
+  median: number;
+  shrunk: number;
+}
+
+/** The value fit: the slopes, the per-category offsets, the sample it was measured on. */
+export interface ValueFit {
+  /** ln(mcap/tvl) = intercept + tvlSlope*ln(tvl) + ageSlope*ln(age) + growthSlope*tanh(g/45) + offset */
+  intercept: number;
+  tvlSlope: number;
+  ageSlope: number;
+  growthSlope: number;
+  /** Shrunk mean-residual offset per category, exp()'d into a multiple for display. */
+  offsets: Map<string, number>;
+  /** How many live-token protocols the fit read, and how well it explains them. */
+  n: number;
+  r2: number;
+  rmseLog: number;
+  /** The pooled (offset-free) multiple, used when a category was never measured. */
+  pooled: number;
+  perCategory: CategoryComp[];
+}
+
+const GROWTH_SCALE = 45;
+const RIDGE_LAMBDA = 0.3;
+const OFFSET_SHRINK_K = 3;
+
+/** Solve a small dense system A x = b by Gauss-Jordan with partial pivoting. */
+function solve(A: number[][], b: number[]): number[] | null {
+  const k = A.length;
+  const M: number[][] = A.map((row, i) => [...row, b[i]!]);
+  for (let c = 0; c < k; c++) {
+    let piv = c;
+    for (let r = c + 1; r < k; r++) if (Math.abs(M[r]![c]!) > Math.abs(M[piv]![c]!)) piv = r;
+    if (piv !== c) { const t = M[c]!; M[c] = M[piv]!; M[piv] = t; }
+    const d = M[c]![c]!;
+    if (!Number.isFinite(d) || Math.abs(d) < 1e-12) return null;
+    for (let j = c; j <= k; j++) M[c]![j] = M[c]![j]! / d;
+    for (let r = 0; r < k; r++) {
+      if (r === c) continue;
+      const f = M[r]![c]!;
+      if (Math.abs(f) < 1e-14) continue;
+      for (let j = c; j <= k; j++) M[r]![j] = M[r]![j]! - f * M[c]![j]!;
     }
   }
-  const globalMedian = all.length > 0 ? clamp(median(all), model.comp_floor, model.comp_cap) : model.fallback_multiple;
-  const perCategory: CategoryComp[] = [...ratios.entries()]
-    .map(([category, rs]) => ({
+  return M.map((row) => row[k]!);
+}
+
+/**
+ * Fit the value model on the snapshot's own live-token protocols. This runs on every execution:
+ * the slopes and the category offsets are measured, never memorised. Ridge keeps the fit stable
+ * when two features move together; the offsets are shrunk toward zero by n/(n+K) so a category
+ * with two listings cannot pin a multiplier that a category with fifteen would contradict.
+ */
+export function fitValueModel(snapshot: Snapshot, model: ModelConstants): ValueFit {
+  type Sample = { category: string | null; tvl: number; age: number | null; growth: number; y: number };
+  const sample: Sample[] = [];
+  for (const p of snapshot.protocols) {
+    if (p.mcap_usd === null || !(p.tvl_usd >= 1_000_000) || !Number.isFinite(p.mcap_usd)) continue;
+    const ratio = p.mcap_usd / p.tvl_usd;
+    // The prediction target is a market multiple. Ratios outside the model's band are data errors,
+    // not evidence, and would drag every slope with them, so they stay out of the fit entirely.
+    if (!(ratio >= model.comp_floor) || !(ratio <= model.comp_cap)) continue;
+    sample.push({
+      category: p.category,
+      tvl: p.tvl_usd,
+      age: ageDays(snapshot.as_of, p.listed_at),
+      growth: clamp(finite(p.change_7d, 0), model.growth_floor, model.growth_cap),
+      y: Math.log(ratio),
+    });
+  }
+
+  const features = (s: Sample): number[] => [
+    1,
+    Math.log(s.tvl),
+    Math.log(Math.max(s.age ?? model.maturity_days, 1)),
+    Math.tanh(s.growth / GROWTH_SCALE),
+  ];
+  const pooled = sample.length > 0
+    ? clamp(Math.exp(median(sample.map((s) => s.y))), model.comp_floor, model.comp_cap)
+    : model.fallback_multiple;
+
+  if (sample.length < 8) {
+    // Too little evidence to fit: fall back to the pooled multiple and say so.
+    return {
+      intercept: Math.log(pooled), tvlSlope: 0, ageSlope: 0, growthSlope: 0,
+      offsets: new Map(), n: sample.length, r2: 0, rmseLog: 0, pooled, perCategory: [],
+    };
+  }
+
+  const k = 4;
+  const n = sample.length;
+  const X = sample.map(features);
+  const y = sample.map((s) => s.y);
+  const ATA: number[][] = Array.from({ length: k }, (_, a) =>
+    Array.from({ length: k }, (_, b) => {
+      let acc = 0;
+      for (let i = 0; i < n; i++) acc += X[i]![a]! * X[i]![b]!;
+      // The intercept is not penalised; the slopes are, so a collinear pair cannot blow up.
+      if (a === b && a > 0) acc += RIDGE_LAMBDA;
+      return acc;
+    }),
+  );
+  const ATy = Array.from({ length: k }, (_, a) => {
+    let acc = 0;
+    for (let i = 0; i < n; i++) acc += X[i]![a]! * y[i]!;
+    return acc;
+  });
+  const solved = solve(ATA, ATy);
+  const beta = solved ?? [Math.log(pooled), 0, 0, 0];
+
+  // Residuals by category, then shrink each category's mean residual toward zero.
+  const residuals = new Map<string, number[]>();
+  for (let i = 0; i < n; i++) {
+    const pred = beta[0]! + beta[1]! * X[i]![1]! + beta[2]! * X[i]![2]! + beta[3]! * X[i]![3]!;
+    const key = sample[i]!.category ?? '';
+    const bucket = residuals.get(key);
+    if (bucket === undefined) residuals.set(key, [y[i]! - pred]);
+    else bucket.push(y[i]! - pred);
+  }
+  const offsets = new Map<string, number>();
+  const perCategory: CategoryComp[] = [];
+  for (const [category, rs] of residuals) {
+    if (category === '') continue;
+    const mean = rs.reduce((a, b) => a + b, 0) / rs.length;
+    const shrunk = (mean * rs.length) / (rs.length + OFFSET_SHRINK_K);
+    offsets.set(category, shrunk);
+    perCategory.push({
       category,
       n: rs.length,
-      median: median(rs),
-      shrunk: clamp((rs.length * median(rs) + model.shrink_k * globalMedian) / (rs.length + model.shrink_k), model.comp_floor, model.comp_cap),
-    }))
-    .sort((a, b) => a.category < b.category ? -1 : a.category > b.category ? 1 : 0);
-  return { perCategory, globalMedian };
+      median: round4(Math.exp(mean)),
+      shrunk: round4(Math.exp(shrunk)),
+    });
+  }
+  perCategory.sort((a, b) => (a.category < b.category ? -1 : a.category > b.category ? 1 : 0));
+
+  // Report the fit honestly: R² and residual spread on the same sample it was measured on.
+  let ssRes = 0;
+  const meanY = y.reduce((a, b) => a + b, 0) / n;
+  let ssTot = 0;
+  for (let i = 0; i < n; i++) {
+    const off = offsets.get(sample[i]!.category ?? '') ?? 0;
+    const pred = beta[0]! + beta[1]! * X[i]![1]! + beta[2]! * X[i]![2]! + beta[3]! * X[i]![3]! + off;
+    ssRes += (y[i]! - pred) ** 2;
+    ssTot += (y[i]! - meanY) ** 2;
+  }
+  return {
+    intercept: round4(beta[0]!),
+    tvlSlope: round4(beta[1]!),
+    ageSlope: round4(beta[2]!),
+    growthSlope: round4(beta[3]!),
+    offsets,
+    n,
+    r2: ssTot > 0 ? round4(1 - ssRes / ssTot) : 0,
+    rmseLog: round4(Math.sqrt(ssRes / n)),
+    pooled,
+    perCategory,
+  };
+}
+
+/**
+ * The multiple one protocol is valued at: the fitted curve at its own tvl, age and growth, plus
+ * its category's learned offset. A protocol whose category was never measured falls back to the
+ * curve alone, which is the pooled market, not a name-based guess.
+ */
+export function compFor(fit: ValueFit, p: SnapshotProtocol, asOf: string, model: ModelConstants): number {
+  const age = ageDays(asOf, p.listed_at);
+  const growth = clamp(finite(p.change_7d, 0), model.growth_floor, model.growth_cap);
+  const ln = fit.intercept
+    + fit.tvlSlope * Math.log(Math.max(p.tvl_usd, 1))
+    + fit.ageSlope * Math.log(Math.max(age ?? model.maturity_days, 1))
+    + fit.growthSlope * Math.tanh(growth / GROWTH_SCALE)
+    + (p.category === null ? 0 : fit.offsets.get(p.category) ?? 0);
+  return clamp(Math.exp(ln), model.comp_floor, model.comp_cap);
+}
+
+/**
+ * Kept for the Model tab: the same fit, reported as one row per category with the multiple the
+ * page displays. `globalMedian` is the pooled market multiple the fit falls back to.
+ */
+export function categoryComps(snapshot: Snapshot, model: ModelConstants): { perCategory: CategoryComp[]; globalMedian: number } {
+  const fit = fitValueModel(snapshot, model);
+  return { perCategory: fit.perCategory, globalMedian: fit.pooled };
 }
 
 /** The three multipliers, the odds and the implied value one protocol gets under `model`. */
@@ -445,10 +625,10 @@ function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
 }
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
-export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, comps?: CategoryComp[], globalMedian?: number): BoardRow[] {
-  const evidence = comps ?? categoryComps(snapshot, model).perCategory;
-  const gm = globalMedian ?? categoryComps(snapshot, model).globalMedian;
-  const compOf = new Map(evidence.map((c) => [c.category, c.shrunk]));
+export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, fit?: ValueFit): BoardRow[] {
+  // One fit for the whole board: the slopes and every category offset are measured on the
+  // snapshot's own live-token protocols, so every row is valued on the same evidence.
+  const valueFit = fit ?? fitValueModel(snapshot, model);
   const index = bySlug(snapshot.protocols);
   const chosen: SnapshotProtocol[] = [];
   const seen = new Set<string>();
@@ -466,7 +646,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, co
     }
   }
   const scored = chosen.map((p) => {
-    const comp = compOf.get(p.category ?? '') ?? gm;
+    const comp = compFor(valueFit, p, snapshot.as_of, model);
     const s = scoreProtocol(p, snapshot.as_of, model, comp);
     return { p, comp, ...s };
   });
@@ -490,8 +670,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, co
     model: {
       fdv_proxy_usd: s.fdvProxy,
       comp_multiple: round4(s.comp),
-      comp_n: evidence.find((c) => c.category === (s.p.category ?? ''))?.n ?? 0,
-      comp_median: round4(evidence.find((c) => c.category === (s.p.category ?? ''))?.median ?? 0),
+      comp_n: valueFit.perCategory.find((c) => c.category === (s.p.category ?? ''))?.n ?? 0,
+      comp_median: round4(valueFit.perCategory.find((c) => c.category === (s.p.category ?? ''))?.median ?? 0),
       growth_pct: s.growthPct,
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
@@ -568,8 +748,10 @@ export function pageFarmSteps(steps: string[]): string[] {
 
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
-  const { perCategory, globalMedian } = categoryComps(snapshot, model);
-  const board = buildBoard(snapshot, model, perCategory, globalMedian);
+  // Fit once, use it for the products: the board's comps and the Model tab's table come from the
+  // same regression, so the page can never show a multiple the ranking did not use.
+  const fit = fitValueModel(snapshot, model);
+  const board = buildBoard(snapshot, model, fit);
   const live = liveRows(snapshot);
   const radar: RadarData = {
     as_of: snapshot.as_of,
@@ -587,7 +769,21 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
       farm_steps_total: row.farm_steps.length,
     })),
     live: live.slice(0, 120),
-    categories: perCategory,
+    categories: fit.perCategory,
+    global_median: fit.pooled,
+    value_fit: {
+      kinds: 'ridge-regression of ln(mcap/tvl) on ln(tvl), ln(age_days), tanh(change_7d/45), plus a shrunk per-category offset',
+      refit: 'on every run, from the snapshot\'s own live-token protocols',
+      intercept: fit.intercept,
+      tvl_slope: fit.tvlSlope,
+      age_slope: fit.ageSlope,
+      growth_slope: fit.growthSlope,
+      sample_n: fit.n,
+      r2: fit.r2,
+      rmse_log: fit.rmseLog,
+      offset_shrink_k: OFFSET_SHRINK_K,
+      ridge_lambda: RIDGE_LAMBDA,
+    },
   };
   return { board, radar };
 }
