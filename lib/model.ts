@@ -78,17 +78,14 @@ export const MODEL: ModelConstants = {
   maturity_floor: 0.75,
   maturity_range: 0.25,
   maturity_days: 1460,
-  odds_base: 0.25,
-  odds_growth: 0.18,
-  odds_tanh_scale: 45,
-  odds_age: 0.28,
-  odds_age_days: 900,
-  odds_age_unknown: 0.14,
-  odds_min: 0.05,
-  odds_max: 0.85,
+  // Odds are no longer constants: fitOddsModel in lib/odds.ts measures every coefficient from the
+  // snapshot's own peers on every run. These two remain only as the clamp band the fitted
+  // probability is held inside, so no protocol can be printed at 0% or certain.
+  odds_min: 0.03,
+  odds_max: 0.92,
 };
 
-export const MODEL_VERSION = 'prelaunch-ev2';
+export const MODEL_VERSION = 'prelaunch-ev3';
 
 /** A farm step: the action, what it costs, and how long it takes. */
 export interface FarmStep {
@@ -125,6 +122,8 @@ export interface BoardRow {
     odds: number;
   };
   farm_steps: string[];
+  /** Is farming this protocol worth the money, the fees and the hours? Computed, not asserted. */
+  farm: FarmVerdict;
 }
 
 /** The dashboard's compact view of one row. */
@@ -148,6 +147,7 @@ export interface RadarRow {
   maturity_multiplier: number;
   odds: number;
   farm_steps: string[];
+  farm: FarmVerdict;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value. */
@@ -211,6 +211,45 @@ export interface RadarData {
     active_terms: string[];
     term_trials: { term: string; kept: boolean; cv_rmse_log: number; delta: number }[];
   };
+  /** The odds model: fitted, not asserted, with the same held-out honesty as the value fit. */
+  odds_fit: {
+    kinds: string;
+    refit: string;
+    intercept: number;
+    age_slope: number;
+    growth_slope: number;
+    offsets: { category: string; offset: number }[];
+    base_rate: number;
+    sample_n: number;
+    with_token: number;
+    brier_in_sample: number;
+    brier_base: number;
+    brier_loo: number;
+    loo_skill: number;
+    brier_walk_forward: number;
+    walk_forward_skill: number;
+    walk_forward_train: number;
+    walk_forward_test: number;
+    walk_forward_cut: number;
+    active_terms: string[];
+    trials: { term: string; kept: boolean; brier: number; delta: number }[];
+    lambda: number;
+  };
+  /** The stated economics the verdicts were computed under, so the page can print them. */
+  assumptions: FarmAssumptions;
+  /** How many rows each verdict got — the page's headline answer. */
+  verdict_counts: { farm: number; marginal: number; skip: number };
+  /** Every snapshot protocol in exactly one group: the page's proof it covered the whole universe. */
+  accounting: {
+    total: number;
+    watchlist_size: number;
+    watchlist_ranked: number;
+    early_ranked: number;
+    board_size: number;
+    live_trading: number;
+    token_no_cap: number;
+    out_of_scope: number;
+  };
 }
 
 /** Why the snapshot is not one this model can score. */
@@ -267,6 +306,7 @@ export function isFarmableSubject(p: SnapshotProtocol): boolean {
 }
 
 const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
+const round6 = (n: number): number => Math.round(n * 1e6) / 1e6;
 const clamp = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v));
 
 /** The median of a finite list of positive numbers. */
@@ -704,12 +744,28 @@ export function categoryComps(snapshot: Snapshot, model: ModelConstants): { perC
   return { perCategory: fit.perCategory, globalMedian: fit.pooled };
 }
 
-/** The three multipliers, the odds and the implied value one protocol gets under `model`. */
+import {
+  fitOddsModel,
+  oddsFor,
+  type OddsFit,
+} from './odds.ts';
+import {
+  DEFAULT_ASSUMPTIONS,
+  farmVerdict,
+  type FarmAssumptions,
+  type FarmVerdict,
+} from './farm.ts';
+
+/** The three multipliers, the odds and the implied value one protocol gets under `model`.
+ * The odds come from the fitted `OddsFit` (lib/odds.ts), not from constants: every coefficient
+ * they are computed with was measured on this snapshot's own peers during this run.
+ */
 export function scoreProtocol(
   p: SnapshotProtocol,
   asOf: string,
   model: ModelConstants,
   compMultiple: number,
+  oddsFit: OddsFit,
 ): { implied: number; fdvProxy: number; odds: number; growthPct: number; growthMult: number; maturityMult: number; age: number | null } {
   const age = ageDays(asOf, p.listed_at);
   const growthPct = clamp(finite(p.change_7d, 0), model.growth_floor, model.growth_cap);
@@ -719,12 +775,9 @@ export function scoreProtocol(
     ageForModel === null
       ? model.maturity_floor + model.maturity_range * 0.5
       : model.maturity_floor + model.maturity_range * (Math.min(ageForModel, model.maturity_days) / model.maturity_days);
-  const fdvProxy = Math.max(1, p.tvl_usd * compMultiple * growthMult * maturityMult);
-  const ageTerm =
-    ageForModel === null
-      ? model.odds_age_unknown
-      : model.odds_age * (Math.min(ageForModel, model.odds_age_days) / model.odds_age_days);
-  const odds = clamp(model.odds_base + model.odds_growth * Math.tanh(growthPct / model.odds_tanh_scale) + ageTerm, model.odds_min, model.odds_max);
+  // Value if a token launches: the fitted multiple applied to the protocol's own TVL.
+  const fdvProxy = Math.max(1, p.tvl_usd * compMultiple);
+  const odds = oddsFor(oddsFit, p, asOf, model.odds_min, model.odds_max);
   const implied = Math.max(1, Math.round(fdvProxy * odds));
   return { implied, fdvProxy: Math.round(fdvProxy), odds, growthPct, growthMult, maturityMult, age };
 }
@@ -874,10 +927,11 @@ function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
 }
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
-export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, fit?: ValueFit): BoardRow[] {
+export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, fit?: ValueFit, oddsFit?: OddsFit, assumptions?: FarmAssumptions): BoardRow[] {
   // One fit for the whole board: the slopes and every category offset are measured on the
   // snapshot's own live-token protocols, so every row is valued on the same evidence.
   const valueFit = fit ?? fitValueModel(snapshot, model);
+  const odds = oddsFit ?? fitOddsModel(snapshot.protocols, snapshot.as_of);
   const index = bySlug(snapshot.protocols);
   const chosen: SnapshotProtocol[] = [];
   const seen = new Set<string>();
@@ -896,7 +950,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, fi
   }
   const scored = chosen.map((p) => {
     const comp = compFor(valueFit, p, snapshot.as_of, model);
-    const s = scoreProtocol(p, snapshot.as_of, model, comp);
+    const s = scoreProtocol(p, snapshot.as_of, model, comp, odds);
     return { p, comp, ...s };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
@@ -927,6 +981,13 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, fi
       odds: round4(s.odds),
     },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
+    farm: farmVerdict({
+      tvl_usd: s.p.tvl_usd,
+      chains: s.p.chains,
+      implied_value_usd: s.implied,
+      odds: s.odds,
+      assumptions: assumptions ?? DEFAULT_ASSUMPTIONS,
+    }),
   }));
 }
 
@@ -969,6 +1030,7 @@ export function radarRow(row: BoardRow): RadarRow {
     maturity_multiplier: row.model.maturity_multiplier,
     odds: row.model.odds,
     farm_steps: row.farm_steps,
+    farm: row.farm,
   };
 }
 
@@ -996,11 +1058,12 @@ export function pageFarmSteps(steps: string[]): string[] {
 }
 
 /** Everything the dashboard renders, from the snapshot. */
-export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
+export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL, assumptions?: FarmAssumptions): { board: BoardRow[]; radar: RadarData } {
   // Fit once, use it for the products: the board's comps and the Model tab's table come from the
   // same regression, so the page can never show a multiple the ranking did not use.
   const fit = fitValueModel(snapshot, model);
-  const board = buildBoard(snapshot, model, fit);
+  const odds = fitOddsModel(snapshot.protocols, snapshot.as_of);
+  const board = buildBoard(snapshot, model, fit, odds, assumptions);
   const live = liveRows(snapshot);
   const radar: RadarData = {
     as_of: snapshot.as_of,
@@ -1043,8 +1106,71 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
       active_terms: fit.activeTerms,
       term_trials: fit.termTrials,
     },
+    odds_fit: {
+      kinds: 'logistic regression of "records a token" on ln(1 + age/365) and tanh(change_7d/45), plus a shrunk per-category offset in logit space',
+      refit: 'on every run, from the snapshot\'s own protocols',
+      intercept: odds.intercept,
+      age_slope: odds.ageSlope,
+      growth_slope: odds.growthSlope,
+      offsets: [...odds.offsets.entries()].map(([category, offset]) => ({ category, offset: round4(offset) })).sort((a, b) => (a.category < b.category ? -1 : 1)),
+      base_rate: round4(odds.baseRate),
+      sample_n: odds.n,
+      with_token: odds.withToken,
+      brier_in_sample: round6(odds.brierInSample),
+      brier_base: round6(odds.brierBase),
+      brier_loo: round6(odds.brierLoo),
+      loo_skill: round4(odds.looSkill),
+      brier_walk_forward: round6(odds.brierWalkForward),
+      walk_forward_skill: round4(odds.walkForwardSkill),
+      walk_forward_train: odds.walkForwardTrain,
+      walk_forward_test: odds.walkForwardTest,
+      walk_forward_cut: odds.walkForwardCut,
+      active_terms: odds.activeTerms,
+      trials: odds.trials,
+      lambda: odds.lambda,
+    },
+    assumptions: assumptions ?? DEFAULT_ASSUMPTIONS,
+    verdict_counts: {
+      farm: board.filter((r) => r.farm.verdict === 'farm').length,
+      marginal: board.filter((r) => r.farm.verdict === 'marginal').length,
+      skip: board.filter((r) => r.farm.verdict === 'skip').length,
+    },
+    accounting: accounting(snapshot, board),
   };
   return { board, radar };
+}
+
+/** Every protocol in the snapshot placed in exactly one group, so the page can prove the board's universe. */
+export function accounting(snapshot: Snapshot, board: BoardRow[]): RadarData['accounting'] {
+  const rows = new Set(board.map((r) => r.slug));
+  const watch = new Set(snapshot.watchlist);
+  let watchlistRanked = 0;
+  let earlyRanked = 0;
+  let liveTrading = 0;
+  let tokenNoCap = 0;
+  let outOfScope = 0;
+  for (const p of snapshot.protocols) {
+    if (rows.has(p.slug)) {
+      if (watch.has(p.slug)) watchlistRanked += 1;
+      else earlyRanked += 1;
+    } else if (p.mcap_usd !== null && p.mcap_usd > 0) {
+      liveTrading += 1;
+    } else if (p.mcap_usd !== null) {
+      tokenNoCap += 1;
+    } else {
+      outOfScope += 1;
+    }
+  }
+  return {
+    total: snapshot.protocols.length,
+    watchlist_size: snapshot.watchlist.length,
+    watchlist_ranked: watchlistRanked,
+    early_ranked: earlyRanked,
+    board_size: board.length,
+    live_trading: liveTrading,
+    token_no_cap: tokenNoCap,
+    out_of_scope: outOfScope,
+  };
 }
 
 /** The snapshot out of a file's text, refused unless it is the shape the model scores. */
@@ -1108,6 +1234,14 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
   }
   const missing = snapshot.watchlist.filter((slug) => !slugs.has(slug));
   if (missing.length > 0) return `the watchlist's first missing slug is ${missing[0]}`;
+
+  // The accounting the page prints is also a check: every snapshot protocol has to land in exactly
+  // one group and the groups have to sum to the whole input. If they do not, the page would be
+  // publishing a universe that does not add up, so the run refuses rather than ship it.
+  const acct = accounting(snapshot, board);
+  const sum = acct.watchlist_ranked + acct.early_ranked + acct.live_trading + acct.token_no_cap + acct.out_of_scope;
+  if (sum !== acct.total) return `accounting sums to ${sum} but the snapshot holds ${acct.total} protocols`;
+  if (acct.board_size !== board.length) return `accounting says ${acct.board_size} board rows but the board holds ${board.length}`;
   return null;
 }
 
