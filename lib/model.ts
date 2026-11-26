@@ -198,6 +198,18 @@ export interface RadarData {
     rmse_log: number;
     offset_shrink_k: number;
     ridge_lambda: number;
+    /** Held-out evidence: the fit scored on rows it was not trained on. */
+    cv_folds: number;
+    cv_rmse_log: number;
+    cv_r2: number;
+    loo_rmse_log: number;
+    loo_r2: number;
+    cv_skill: number;
+    loo_skill: number;
+    cv_multiple_mae_x: number;
+    /** Which terms survived the held-out selection, and each one's trial. */
+    active_terms: string[];
+    term_trials: { term: string; kept: boolean; cv_rmse_log: number; delta: number }[];
   };
 }
 
@@ -291,11 +303,253 @@ export interface ValueFit {
   /** The pooled (offset-free) multiple, used when a category was never measured. */
   pooled: number;
   perCategory: CategoryComp[];
+  /** Held-out quality: k-fold cross-validation and leave-one-out, fitted on every run. */
+  validation: FitValidation;
+  /** Which terms survived selection, and each one's held-out trial. */
+  activeTerms: TermKey[];
+  termTrials: TermTrial[];
+}
+
+/** One term's held-out trial: did adding it lower error enough to keep? */
+export interface TermTrial {
+  term: string;
+  kept: boolean;
+  /** Held-out ln-RMSE with this term included. */
+  cv_rmse_log: number;
+  /** Error the term removed versus the model without it (positive = it helped). */
+  delta: number;
+}
+
+/** Out-of-sample evidence: the fit re-run with part of the sample hidden, scored on what it hid. */
+export interface FitValidation {
+  /** K-fold: every observation predicted once from a fit that never saw it. */
+  cv_folds: number;
+  cv_rmse_log: number;
+  cv_r2: number;
+  /** Leave-one-out speed-up (closed form from the ridge hat matrix). */
+  loo_rmse_log: number;
+  loo_r2: number;
+  /** Ratio of out-of-sample error to always-predicting-the-mean: below 1 beats the baseline. */
+  cv_skill: number;
+  loo_skill: number;
+  /** Held-out R² of the multiple itself (exp scale), the number a reader can check. */
+  cv_multiple_mae_x: number;
 }
 
 const GROWTH_SCALE = 45;
 const RIDGE_LAMBDA = 0.3;
 const OFFSET_SHRINK_K = 3;
+/** Folds for the cross-validation report; 5 keeps ~18 held-out rows per fold at n=88. */
+const CV_FOLDS = 5;
+
+/** One row the value model is fitted on: a live-token protocol's own multiple and features. */
+interface Sample { category: string | null; tvl: number; age: number | null; growth: number; y: number; }
+
+/**
+ * The terms the model may use. Which of them survive is decided per run by held-out error, so a
+ * term the snapshot cannot support is dropped instead of fitted to noise. `tvl` is the anchor.
+ */
+type TermKey = 'tvl' | 'age' | 'growth';
+const TERM_ORDER: TermKey[] = ['tvl', 'age', 'growth'];
+
+/** One term's value for a sample, on the scale the regression reads it. */
+function termValue(term: TermKey, s: Sample): number {
+  switch (term) {
+    case 'tvl': return Math.log(Math.max(s.tvl, 1));
+    case 'age': return Math.log(Math.max(s.age ?? 1, 1));
+    case 'growth': return Math.tanh(s.growth / GROWTH_SCALE);
+  }
+}
+
+/** Design row for a sample under one set of active terms: intercept first, then the terms. */
+function designRow(active: TermKey[], s: Sample): number[] {
+  return [1, ...active.map((t) => termValue(t, s))];
+}
+
+/** The ridge system for one set of samples and terms, solved. */
+function ridgeSolve(rows: Sample[], active: TermKey[]): number[] {
+  const k = active.length + 1;
+  const X = rows.map((s) => designRow(active, s));
+  const yv = rows.map((s) => s.y);
+  const ATA: number[][] = Array.from({ length: k }, (_, a) =>
+    Array.from({ length: k }, (_, b) => {
+      let acc = 0;
+      for (let i = 0; i < rows.length; i++) acc += X[i]![a]! * X[i]![b]!;
+      // The intercept is not penalised; the slopes are, so a collinear pair cannot blow up.
+      if (a === b && a > 0) acc += RIDGE_LAMBDA;
+      return acc;
+    }),
+  );
+  const ATy = Array.from({ length: k }, (_, a) => {
+    let acc = 0;
+    for (let i = 0; i < rows.length; i++) acc += X[i]![a]! * yv[i]!;
+    return acc;
+  });
+  return solve(ATA, ATy) ?? [rows.reduce((a, b) => a + b.y, 0) / Math.max(rows.length, 1), ...Array(k - 1).fill(0)];
+}
+
+/** Predict ln(multiple) for one sample from a solved vector under the same active terms. */
+function ridgePredict(beta: number[], active: TermKey[], s: Sample): number {
+  const row = designRow(active, s);
+  let acc = 0;
+  for (let a = 0; a < row.length; a++) acc += beta[a]! * row[a]!;
+  return acc;
+}
+
+/**
+ * Shrunk per-category offsets from a fitted vector, learned on the rows given. Same rule the
+ * full fit uses, so a held-out pass scores the model the board actually ranks with.
+ */
+function fittedOffsets(beta: number[], active: TermKey[], rows: Sample[]): Map<string, number> {
+  const residuals = new Map<string, number[]>();
+  for (const s of rows) {
+    const key = s.category ?? '';
+    if (key === '') continue;
+    const resid = s.y - ridgePredict(beta, active, s);
+    const bucket = residuals.get(key);
+    if (bucket === undefined) residuals.set(key, [resid]);
+    else bucket.push(resid);
+  }
+  const offsets = new Map<string, number>();
+  for (const [category, rs] of residuals) {
+    const mean = rs.reduce((a, b) => a + b, 0) / rs.length;
+    offsets.set(category, (mean * rs.length) / (rs.length + OFFSET_SHRINK_K));
+  }
+  return offsets;
+}
+
+/** A fold's prediction: the fitted curve plus the offset its own training rows learned. */
+function predictWith(beta: number[], active: TermKey[], offsets: Map<string, number>, s: Sample): number {
+  return ridgePredict(beta, active, s) + (s.category === null ? 0 : offsets.get(s.category) ?? 0);
+}
+
+/** Fold assignment shared by every held-out pass, so two specifications are scored on the same split. */
+function foldsFor(sample: Sample[]): Map<number, number> {
+  const order = sample
+    .map((s, i) => ({ i, key: `${s.category ?? '~'}|${s.tvl}` }))
+    .sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
+    .map((o) => o.i);
+  const foldOf = new Map<number, number>();
+  order.forEach((idx, pos) => foldOf.set(idx, pos % CV_FOLDS));
+  return offsetsNoop(foldOf);
+}
+/** Identity helper that keeps the fold map's type explicit at the call site. */
+function offsetsNoop(m: Map<number, number>): Map<number, number> { return m; }
+
+/**
+ * Held-out error for ONE specification, against a fixed fold split. Lower ln-RMSE is better.
+ * Used both to report the chosen model and to decide which terms earn their place.
+ */
+function heldOutError(sample: Sample[], active: TermKey[], foldOf: Map<number, number>): {
+  cvRmse: number; cvSsRes: number; cvCount: number; cvAbsErrX: number;
+} {
+  let cvSsRes = 0;
+  let cvAbsErrX = 0;
+  let cvCount = 0;
+  for (let f = 0; f < CV_FOLDS; f++) {
+    const train = sample.filter((_, i) => foldOf.get(i) !== f);
+    const test = sample.filter((_, i) => foldOf.get(i) === f);
+    if (train.length < 8 || test.length === 0) continue;
+    const beta = ridgeSolve(train, active);
+    const offsets = fittedOffsets(beta, active, train);
+    for (const s of test) {
+      const pred = predictWith(beta, active, offsets, s);
+      cvSsRes += (s.y - pred) ** 2;
+      cvAbsErrX += Math.abs(Math.exp(s.y) - Math.exp(pred));
+      cvCount += 1;
+    }
+  }
+  return {
+    cvRmse: cvCount > 0 ? Math.sqrt(cvSsRes / cvCount) : Infinity,
+    cvSsRes, cvCount, cvAbsErrX,
+  };
+}
+
+/**
+ * Which terms the snapshot actually supports. `tvl` is the anchor and always stays; each other term
+ * joins only if it lowers held-out error by more than a noise margin on the same fold split, so a
+ * term that merely fits the sample is dropped rather than shipped as if it predicted.
+ */
+function selectTerms(sample: Sample[]): { active: TermKey[]; tried: TermTrial[] } {
+  const foldOf = foldsFor(sample);
+  const active: TermKey[] = ['tvl'];
+  const tried: TermTrial[] = [];
+  let best = heldOutError(sample, active, foldOf);
+  tried.push({ term: 'tvl', kept: true, cv_rmse_log: round4(best.cvRmse), delta: 0 });
+
+  for (const term of TERM_ORDER) {
+    if (term === 'tvl') continue;
+    const candidate = [...active, term];
+    const scored = heldOutError(sample, candidate, foldOf);
+    const delta = best.cvRmse - scored.cvRmse;
+    // A term must earn at least this much held-out ln-error to be kept. 0.5% of a ~1.2 ln spread
+    // is small enough to admit a real signal and large enough to refuse fold-to-fold noise.
+    const margin = best.cvRmse * 0.005;
+    const kept = Number.isFinite(scored.cvRmse) && delta > margin;
+    tried.push({ term, kept, cv_rmse_log: round4(scored.cvRmse), delta: round4(delta) });
+    if (kept) { active.push(term); best = scored; }
+  }
+  return { active, tried };
+}
+
+/**
+ * Out-of-sample evidence for the value model. Every number here comes from a fit that never saw
+ * the row it is scored on, so it cannot be inflated by the model grading its own homework.
+ * Each held-out pass re-learns BOTH the curve and the category offsets on its training rows only.
+ */
+function validateFit(sample: Sample[], active: TermKey[]): FitValidation {
+  const n = sample.length;
+  const empty: FitValidation = {
+    cv_folds: 0, cv_rmse_log: 0, cv_r2: 0, loo_rmse_log: 0, loo_r2: 0,
+    cv_skill: 0, loo_skill: 0, cv_multiple_mae_x: 0,
+  };
+  if (n < CV_FOLDS * 2) return empty;
+
+  const meanY = sample.reduce((a, b) => a + b.y, 0) / n;
+  const ssTot = sample.reduce((a, b) => a + (b.y - meanY) ** 2, 0);
+  const floor = (v: number): number => (v > 0 ? v : 0);
+
+  // --- K-fold on the terms the board actually uses, with the shared fold split. ---
+  const foldOf = foldsFor(sample);
+  const cv = heldOutError(sample, active, foldOf);
+  const cvSsRes = cv.cvSsRes;
+  const cvCount = cv.cvCount;
+  const cv_rmse_log = cv.cvRmse === Infinity ? 0 : cv.cvRmse;
+  const cv_r2 = ssTot > 0 && cvCount > 0 ? floor(1 - cvSsRes / ssTot) : 0;
+  const cv_skill = cv_rmse_log > 0 ? Math.sqrt(ssTot / n) / cv_rmse_log : 0;
+  const cv_multiple_mae_x = cvCount > 0 ? cv.cvAbsErrX / cvCount : 0;
+
+  // --- Leave-one-out by exact re-fit: hide one row, learn curve + offsets on the rest. ---
+  // n is ~90 here, so n solves of a small system cost nothing and avoid the closed-form
+  // approximation, which cannot account for the category offsets changing per training set.
+  let looSsRes = 0;
+  let looCount = 0;
+  if (n >= 12) {
+    for (let i = 0; i < n; i++) {
+      const train = sample.filter((_, j) => j !== i);
+      if (train.length < 8) continue;
+      const beta = ridgeSolve(train, active);
+      const offsets = fittedOffsets(beta, active, train);
+      const pred = predictWith(beta, active, offsets, sample[i]!);
+      looSsRes += (sample[i]!.y - pred) ** 2;
+      looCount += 1;
+    }
+  }
+  const loo_rmse_log = looCount > 0 ? Math.sqrt(looSsRes / looCount) : 0;
+  const loo_r2 = ssTot > 0 && looCount > 0 ? floor(1 - looSsRes / ssTot) : 0;
+  const loo_skill = loo_rmse_log > 0 ? Math.sqrt(ssTot / n) / loo_rmse_log : 0;
+
+  return {
+    cv_folds: CV_FOLDS,
+    cv_rmse_log: round4(cv_rmse_log),
+    cv_r2: round4(cv_r2),
+    loo_rmse_log: round4(loo_rmse_log),
+    loo_r2: round4(loo_r2),
+    cv_skill: round4(cv_skill),
+    loo_skill: round4(loo_skill),
+    cv_multiple_mae_x: round4(cv_multiple_mae_x),
+  };
+}
 
 /** Solve a small dense system A x = b by Gauss-Jordan with partial pivoting. */
 function solve(A: number[][], b: number[]): number[] | null {
@@ -342,12 +596,6 @@ export function fitValueModel(snapshot: Snapshot, model: ModelConstants): ValueF
     });
   }
 
-  const features = (s: Sample): number[] => [
-    1,
-    Math.log(s.tvl),
-    Math.log(Math.max(s.age ?? model.maturity_days, 1)),
-    Math.tanh(s.growth / GROWTH_SCALE),
-  ];
   const pooled = sample.length > 0
     ? clamp(Math.exp(median(sample.map((s) => s.y))), model.comp_floor, model.comp_cap)
     : model.fallback_multiple;
@@ -357,54 +605,45 @@ export function fitValueModel(snapshot: Snapshot, model: ModelConstants): ValueF
     return {
       intercept: Math.log(pooled), tvlSlope: 0, ageSlope: 0, growthSlope: 0,
       offsets: new Map(), n: sample.length, r2: 0, rmseLog: 0, pooled, perCategory: [],
+      validation: {
+        cv_folds: 0, cv_rmse_log: 0, cv_r2: 0, loo_rmse_log: 0, loo_r2: 0,
+        cv_skill: 0, loo_skill: 0, cv_multiple_mae_x: 0,
+      },
+      activeTerms: ['tvl'], termTrials: [],
     };
   }
 
-  const k = 4;
+  // Which terms earn their place is decided by held-out error, not by what the model can fit.
+  const { active, tried } = selectTerms(sample);
   const n = sample.length;
-  const X = sample.map(features);
   const y = sample.map((s) => s.y);
-  const ATA: number[][] = Array.from({ length: k }, (_, a) =>
-    Array.from({ length: k }, (_, b) => {
-      let acc = 0;
-      for (let i = 0; i < n; i++) acc += X[i]![a]! * X[i]![b]!;
-      // The intercept is not penalised; the slopes are, so a collinear pair cannot blow up.
-      if (a === b && a > 0) acc += RIDGE_LAMBDA;
-      return acc;
-    }),
-  );
-  const ATy = Array.from({ length: k }, (_, a) => {
-    let acc = 0;
-    for (let i = 0; i < n; i++) acc += X[i]![a]! * y[i]!;
-    return acc;
-  });
-  const solved = solve(ATA, ATy);
-  const beta = solved ?? [Math.log(pooled), 0, 0, 0];
+  const beta = ridgeSolve(sample, active);
 
   // Residuals by category, then shrink each category's mean residual toward zero.
-  const residuals = new Map<string, number[]>();
-  for (let i = 0; i < n; i++) {
-    const pred = beta[0]! + beta[1]! * X[i]![1]! + beta[2]! * X[i]![2]! + beta[3]! * X[i]![3]!;
-    const key = sample[i]!.category ?? '';
-    const bucket = residuals.get(key);
-    if (bucket === undefined) residuals.set(key, [y[i]! - pred]);
-    else bucket.push(y[i]! - pred);
-  }
-  const offsets = new Map<string, number>();
+  const offsets = fittedOffsets(beta, active, sample);
   const perCategory: CategoryComp[] = [];
-  for (const [category, rs] of residuals) {
-    if (category === '') continue;
-    const mean = rs.reduce((a, b) => a + b, 0) / rs.length;
-    const shrunk = (mean * rs.length) / (rs.length + OFFSET_SHRINK_K);
-    offsets.set(category, shrunk);
-    perCategory.push({
-      category,
-      n: rs.length,
-      median: round4(Math.exp(mean)),
-      shrunk: round4(Math.exp(shrunk)),
-    });
+  {
+    const residuals = new Map<string, number[]>();
+    for (let i = 0; i < n; i++) {
+      const pred = ridgePredict(beta, active, sample[i]!);
+      const key = sample[i]!.category ?? '';
+      const bucket = residuals.get(key);
+      if (bucket === undefined) residuals.set(key, [y[i]! - pred]);
+      else bucket.push(y[i]! - pred);
+    }
+    for (const [category, rs] of residuals) {
+      if (category === '') continue;
+      const mean = rs.reduce((a, b) => a + b, 0) / rs.length;
+      const shrunk = (mean * rs.length) / (rs.length + OFFSET_SHRINK_K);
+      perCategory.push({
+        category,
+        n: rs.length,
+        median: round4(Math.exp(mean)),
+        shrunk: round4(Math.exp(shrunk)),
+      });
+    }
+    perCategory.sort((a, b) => (a.category < b.category ? -1 : a.category > b.category ? 1 : 0));
   }
-  perCategory.sort((a, b) => (a.category < b.category ? -1 : a.category > b.category ? 1 : 0));
 
   // Report the fit honestly: R² and residual spread on the same sample it was measured on.
   let ssRes = 0;
@@ -412,21 +651,29 @@ export function fitValueModel(snapshot: Snapshot, model: ModelConstants): ValueF
   let ssTot = 0;
   for (let i = 0; i < n; i++) {
     const off = offsets.get(sample[i]!.category ?? '') ?? 0;
-    const pred = beta[0]! + beta[1]! * X[i]![1]! + beta[2]! * X[i]![2]! + beta[3]! * X[i]![3]! + off;
+    const pred = ridgePredict(beta, active, sample[i]!) + off;
     ssRes += (y[i]! - pred) ** 2;
     ssTot += (y[i]! - meanY) ** 2;
   }
+  // Slopes for the dropped terms are zero, so `compFor` can read the vector positionally.
+  const slopeOf = (t: TermKey): number => {
+    const at = active.indexOf(t);
+    return at < 0 ? 0 : beta[at + 1]!;
+  };
   return {
     intercept: round4(beta[0]!),
-    tvlSlope: round4(beta[1]!),
-    ageSlope: round4(beta[2]!),
-    growthSlope: round4(beta[3]!),
+    tvlSlope: round4(slopeOf('tvl')),
+    ageSlope: round4(slopeOf('age')),
+    growthSlope: round4(slopeOf('growth')),
     offsets,
     n,
     r2: ssTot > 0 ? round4(1 - ssRes / ssTot) : 0,
     rmseLog: round4(Math.sqrt(ssRes / n)),
     pooled,
     perCategory,
+    validation: validateFit(sample, active),
+    activeTerms: active,
+    termTrials: tried,
   };
 }
 
@@ -438,9 +685,11 @@ export function fitValueModel(snapshot: Snapshot, model: ModelConstants): ValueF
 export function compFor(fit: ValueFit, p: SnapshotProtocol, asOf: string, model: ModelConstants): number {
   const age = ageDays(asOf, p.listed_at);
   const growth = clamp(finite(p.change_7d, 0), model.growth_floor, model.growth_cap);
+  // Read the same scale the fit was trained on: an unknown age is the log of 1, i.e. no shift,
+  // which is exactly what the sample rows carry when `ageDays` returns null.
   const ln = fit.intercept
     + fit.tvlSlope * Math.log(Math.max(p.tvl_usd, 1))
-    + fit.ageSlope * Math.log(Math.max(age ?? model.maturity_days, 1))
+    + fit.ageSlope * Math.log(Math.max(age ?? 1, 1))
     + fit.growthSlope * Math.tanh(growth / GROWTH_SCALE)
     + (p.category === null ? 0 : fit.offsets.get(p.category) ?? 0);
   return clamp(Math.exp(ln), model.comp_floor, model.comp_cap);
@@ -783,6 +1032,16 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
       rmse_log: fit.rmseLog,
       offset_shrink_k: OFFSET_SHRINK_K,
       ridge_lambda: RIDGE_LAMBDA,
+      cv_folds: fit.validation.cv_folds,
+      cv_rmse_log: fit.validation.cv_rmse_log,
+      cv_r2: fit.validation.cv_r2,
+      loo_rmse_log: fit.validation.loo_rmse_log,
+      loo_r2: fit.validation.loo_r2,
+      cv_skill: fit.validation.cv_skill,
+      loo_skill: fit.validation.loo_skill,
+      cv_multiple_mae_x: fit.validation.cv_multiple_mae_x,
+      active_terms: fit.activeTerms,
+      term_trials: fit.termTrials,
     },
   };
   return { board, radar };

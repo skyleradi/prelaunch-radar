@@ -191,13 +191,13 @@
       '<div class="formula">implied = TVL <span class="op">×</span> comp× <span class="op">×</span> growth× <span class="op">×</span> maturity× <span class="op">=</span> FDV proxy <span class="op">·</span> implied = FDV <span class="op">×</span> odds</div>' +
       '<div class="factors">' +
       '<div class="factor"><div class="k">TVL</div><div class="v">' + usd(r.tvl_usd) + '</div><div class="s">the snapshot\'s own figure</div></div>' +
-      '<div class="factor"><div class="k">Comp ×</div><div class="v">' + r.comp_multiple.toFixed(2) + '</div><div class="s">' + (r.comp_n ? (r.comp_n === 1 ? '1 live ' + esc(r.category || '') + ' comp' : r.comp_n + ' live ' + esc(r.category || '') + ' comps') + ', median-shrunk' : 'all-category median') + '</div></div>' +
+      '<div class="factor"><div class="k">Comp ×</div><div class="v">' + r.comp_multiple.toFixed(2) + '</div><div class="s">' + (r.comp_n ? (r.comp_n === 1 ? '1 live ' + esc(r.category || '') + ' comp' : r.comp_n + ' live ' + esc(r.category || '') + ' comps') + ', regression fit' : 'fitted, no comps in category') + '</div></div>' +
       '<div class="factor"><div class="k">Growth ×</div><div class="v">' + r.growth_multiplier.toFixed(3) + '</div><div class="s">7d ' + (r.change_7d === null ? 'unreported' : (r.change_7d > 0 ? '+' : '') + r.change_7d.toFixed(1) + '%') + ', weight ' + R.model.growth_weight + '</div></div>' +
       '<div class="factor"><div class="k">Maturity ×</div><div class="v">' + r.maturity_multiplier.toFixed(3) + '</div><div class="s">' + (r.age_days === null ? 'age unknown → mid' : r.age_days + 'd with no token') + '</div></div>' +
       '<div class="factor"><div class="k">FDV proxy</div><div class="v">' + usd(r.fdv_proxy_usd) + '</div><div class="s">what a token may price at</div></div>' +
       '<div class="factor"><div class="k">Odds</div><div class="v">' + Math.round(r.odds * 100) + '%</div><div class="meter"><i style="width:' + Math.round(r.odds * 100) + '%"></i></div></div>' +
       '</div>' +
-      '<p class="compnote">Every factor comes from the sealed snapshot: the comp multiple is the median mcap/TVL of live-token protocols in the same category (shrunk toward the all-category median, n=' + r.comp_n + '), growth is the 7-day TVL change, maturity rises with how long the protocol has run with no token. No name is special-cased — the same formula scores all ' + R.rows.length + ' rows.</p></div>' +
+      '<p class="compnote">Every factor comes from the sealed snapshot: the comp multiple is this protocol\'s own multiple under a ridge regression fitted on every run to the snapshot\'s live-token protocols (ln mcap/TVL on ln TVL, ln age, 7d growth, plus its category offset, n=' + r.comp_n + '), growth is the 7-day TVL change, maturity rises with how long the protocol has run with no token. No name is special-cased — the same formula scores all ' + R.rows.length + ' rows.</p></div>' +
       '<div class="cols2">' +
       '<div class="panel"><h3>Live comps in ' + esc(r.category || 'its category') + '</h3><table class="comptable"><tr><th>Protocol</th><th class="num">MCap</th><th class="num">TVL</th><th class="num">MCap/TVL</th></tr>' +
       (peers.length ? peers.map(function (p) { return '<tr><td>' + esc(p.name) + '</td><td class="num">' + usd(p.mcap_usd) + '</td><td class="num">' + usd(p.tvl_usd) + '</td><td class="num">' + p.ratio.toFixed(2) + '×</td></tr>'; }).join('') : '<tr><td colspan="4" class="empty">No live comps recorded in this category.</td></tr>') +
@@ -244,16 +244,35 @@
       '<table class="mtable"><tr><th>Term</th><th class="num">Coefficient</th><th>Read</th></tr>' +
       [['intercept', f.intercept, 'level of the market multiple'],
        ['ln(TVL)', f.tvl_slope, 'bigger TVL → ' + (f.tvl_slope < 0 ? 'lower' : 'higher') + ' multiple per dollar locked'],
-       ['ln(age days)', f.age_slope, 'older protocol → ' + (f.age_slope < 0 ? 'lower' : 'higher') + ' multiple'],
-       ['tanh(7d% / 45)', f.growth_slope, '7-day TVL growth moves the multiple ' + (f.growth_slope < 0 ? 'down' : 'up')],
+       ['ln(age days)', f.age_slope === 0 ? '0 (dropped)' : f.age_slope, f.age_slope === 0 ? 'refused by the held-out test below' : 'older protocol → ' + (f.age_slope < 0 ? 'lower' : 'higher') + ' multiple'],
+       ['tanh(7d% / 45)', f.growth_slope === 0 ? '0 (dropped)' : f.growth_slope, f.growth_slope === 0 ? 'refused by the held-out test below' : '7-day TVL growth moves the multiple ' + (f.growth_slope < 0 ? 'down' : 'up')],
        ['R² / RMSE(ln)', f.r2.toFixed(3) + ' / ' + f.rmse_log.toFixed(3), 'on the same fit sample']].map(function (row) {
         return '<tr><td class="code">' + row[0] + '</td><td class="num">' + row[1] + '</td><td>' + row[2] + '</td></tr>';
-      }).join('') + '</table></div>';
+      }).join('') + '</table></div>' +
+      (f.term_trials === undefined || f.term_trials.length === 0 ? '' :
+      '<div class="panel"><h3>Held out — what the fit earns on rows it never saw</h3>' +
+      '<p class="method">A fit can always describe the sample it was measured on. The table below re-runs it with data hidden, so the number cannot be inflated by the model grading its own homework. ' +
+      'K-fold hides a fifth of the live comps at a time (<span class="code">' + f.cv_folds + ' folds</span>); leave-one-out hides a single row and refits, ' + f.sample_n + ' times. ' +
+      'Every held-out pass re-learns both the curve and the category offsets from its training rows only.</p>' +
+      '<table class="mtable"><tr><th>Estimate</th><th class="num">R²</th><th class="num">RMSE (ln)</th><th class="num">vs. mean</th></tr>' +
+      [['In sample (fit on all ' + f.sample_n + ')', f.r2, f.rmse_log, '—'],
+       ['Held out, ' + f.cv_folds + '-fold', f.cv_r2, f.cv_rmse_log, f.cv_skill.toFixed(3) + '×'],
+       ['Held out, leave-one-out', f.loo_r2, f.loo_rmse_log, f.loo_skill.toFixed(3) + '×']].map(function (row) {
+        return '<tr><td>' + row[0] + '</td><td class="num">' + (typeof row[1] === 'number' ? row[1].toFixed(3) : row[1]) + '</td><td class="num">' + (typeof row[2] === 'number' ? row[2].toFixed(3) : row[2]) + '</td><td class="num">' + row[3] + '</td></tr>';
+      }).join('') + '</table>' +
+      '<p class="compnote">A "vs. mean" above 1 means the model beats always predicting the average multiple — that is the bar a fitted curve has to clear to be worth anything. ' +
+      'On unseen rows the comp lands within <span class="code">±' + f.cv_multiple_mae_x.toFixed(2) + '×</span> on average.</p>' +
+      '<table class="mtable"><tr><th>Term</th><th class="num">Held-out RMSE</th><th class="num">Δ vs. without</th><th>Verdict</th></tr>' +
+      f.term_trials.map(function (t) {
+        return '<tr><td class="code">' + esc(t.term) + '</td><td class="num">' + t.cv_rmse_log.toFixed(4) + '</td><td class="num">' + (t.delta > 0 ? '+' : '') + t.delta.toFixed(4) + '</td><td>' + (t.kept ? '<b>kept</b> — lowers held-out error' : 'dropped — no held-out gain') + '</td></tr>';
+      }).join('') + '</table>' +
+      '<p class="compnote">This is the honest part: <b>' + f.active_terms.join(', ') + '</b> is what the snapshot can actually support. ' +
+      'A term that only fits the sample is refused here rather than shipped as if it predicted. The board still applies the growth and maturity multipliers to the <i>FDV proxy</i>, where they are a stated modelling choice, not a fitted claim.</p></div>');
     return '<h2 class="page">The model — ' + esc(R.model_version) + '</h2>' +
       '<div class="panel"><h3>Method</h3><p class="method">' +
       'Every pre-token protocol is scored by the same formula, from the sealed snapshot\'s own figures and nothing else. ' +
       '<b>FDV proxy = TVL × comp× × growth× × maturity×</b>, and the board ranks by <b>implied value = FDV proxy × launch odds</b>.<br><br>' +
-      'The <b>comp multiple</b> is this protocol\'s own multiple under a regression fitted to the snapshot\'s live-token protocols — its TVL, its age and its 7-day growth, plus the offset learned for its category — clamped to <span class="code">[' + m.comp_floor + ', ' + m.comp_cap + ']</span>. ' +
+      'The <b>comp multiple</b> is this protocol\'s own multiple under a regression fitted to the snapshot\'s live-token protocols — its TVL plus whichever of its age and 7-day growth survived the held-out test below — plus the offset learned for its category — clamped to <span class="code">[' + m.comp_floor + ', ' + m.comp_cap + ']</span>. ' +
       'The <b>growth multiplier</b> damps the 7-day TVL change to <span class="code">1 + ' + m.growth_weight + '·clamp(g, ' + m.growth_floor + ', ' + m.growth_cap + ')/100</span>. ' +
       'The <b>maturity multiplier</b> rises from <span class="code">' + m.maturity_floor + '</span> to <span class="code">' + (m.maturity_floor + m.maturity_range) + '</span> as the protocol\'s age with no token approaches ' + m.maturity_days + ' days. ' +
       'The <b>launch odds</b> combine the same three signals: <span class="code">' + m.odds_base + ' + ' + m.odds_growth + '·tanh(g/' + m.odds_tanh_scale + ') + ' + m.odds_age + '·min(age,' + m.odds_age_days + ')/' + m.odds_age_days + '</span>, clamped to [' + m.odds_min + ', ' + m.odds_max + ']. ' +
